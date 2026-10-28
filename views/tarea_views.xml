@@ -1,0 +1,68 @@
+
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Vista de lista -->
+    <record id="view_gestion_tarea_tree" model="ir.ui.view">
+        <field name="name">gestion.tarea.tree</field>
+        <field name="model">gestion.tarea</field>
+        <field name="arch" type="xml">
+            <tree string="Tareas" decoration-success="estado == 'completada'">
+                <field name="name"/>
+                <field name="fecha_limite"/>
+                <field name="estado" widget="badge"/>
+            </tree>
+        </field>
+    </record>
+
+    <!-- Vista de formulario -->
+    <record id="view_gestion_tarea_form" model="ir.ui.view">
+        <field name="name">gestion.tarea.form</field>
+        <field name="model">gestion.tarea</field>
+        <field name="arch" type="xml">
+            <form string="Tarea">
+                <sheet>
+                    <div class="oe_title">
+                        <label for="name"/>
+                        <h1>
+                            <field name="name"
+                                   placeholder="Nombre de la tarea"/>
+                        </h1>
+                    </div>
+
+                    <group>
+                        <group>
+                            <field name="fecha_limite"/>
+                            <field name="estado"/>
+                        </group>
+                    </group>
+
+                    <notebook>
+                        <page string="Descripción">
+                            <field name="descripcion"
+                                   placeholder="Describe la tarea..."/>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- Acción -->
+    <record id="action_gestion_tarea" model="ir.actions.act_window">
+        <field name="name">Tareas</field>
+        <field name="res_model">gestion.tarea</field>
+        <field name="view_mode">tree,form</field>
+    </record>
+
+    <!-- Menú principal -->
+    <menuitem id="menu_gestion_tareas_root"
+              name="Gestión de Tareas"
+              sequence="10"/>
+
+    <!-- Submenú -->
+    <menuitem id="menu_gestion_tareas"
+              name="Tareas"
+              parent="menu_gestion_tareas_root"
+              action="action_gestion_tarea"
+              sequence="10"/>
+</odoo>
