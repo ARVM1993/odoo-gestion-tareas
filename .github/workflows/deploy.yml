@@ -22,19 +22,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure SSH
+        
+      - name: Configure SSH and validate key
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+
+          if ! ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/deploy_key.pub; then
+            echo "::error::EC2_SSH_KEY no es una clave privada válida o está incompleta."
+            exit 1
+          fi
+
+          echo "La clave privada es válida."
+          ssh-keygen -lf ~/.ssh/deploy_key.pub
 
           printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+
 
       - name: Validate configuration
         env:
