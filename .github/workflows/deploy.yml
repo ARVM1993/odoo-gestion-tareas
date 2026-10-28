@@ -15,21 +15,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Descargar código del repositorio
       - name: Descargar código
         uses: actions/checkout@v4
 
+      # 2. Configurar conexión SSH
       - name: Configurar SSH
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
+
           printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+
           printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
+      # 3. Detectar cambios XML y sincronizar addon
       - name: Sincronizar módulo con EC2
         id: sync
         env:
@@ -38,28 +45,34 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Detectar cambios XML respecto al commit anterior.
-          if git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" \
-            | grep -E '^(.*/)?views/.*\.xml$'; then
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          # En ejecuciones manuales o primeros commits,
+          # forzar la comprobación de cambios XML.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] ||
+             [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "xml_changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BEFORE" "$AFTER" \
+               | grep -E '(^|/)views/.*\.xml$'; then
             echo "xml_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "xml_changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-          # En la primera ejecución, forzar actualización.
-          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
-            echo "xml_changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
+          # Crear directorio remoto
           ssh "$EC2_USER@$EC2_HOST" \
             'mkdir -p /home/ubuntu/odoo17/addons/gestion_tareas'
 
+          # Copiar el módulo a EC2
           rsync -az --delete \
             --exclude='.git/' \
             --exclude='.github/' \
             -e "ssh -i ~/.ssh/id_ed25519" \
-            ./ "$EC2_USER@$EC2_HOST:/home/ubuntu/odoo17/addons/gestion_tareas/"
+            ./ \
+            "$EC2_USER@$EC2_HOST:/home/ubuntu/odoo17/addons/gestion_tareas/"
 
+      # 4. Limpiar caché, instalar/actualizar y reiniciar si procede
       - name: Limpiar caché y actualizar módulo
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -72,41 +85,57 @@ jobs:
           ssh "$EC2_USER@$EC2_HOST" \
             "ODOO_DB='$ODOO_DB' XML_CHANGED='$XML_CHANGED' bash -s" <<'REMOTE'
           set -euo pipefail
+
           cd /home/ubuntu/odoo17
 
           MODULE=/home/ubuntu/odoo17/addons/gestion_tareas
 
-          # Eliminar únicamente caché Python del módulo.
-          find "$MODULE" -type d -name '__pycache__' -prune -exec rm -rf {} +
-          find "$MODULE" -type f -name '*.pyc' -delete
+          echo "Limpiando caché Python del módulo..."
 
-          # Confirmar que Docker Compose contiene los servicios esperados.
-          docker compose config --services | grep -qx 'odoo'
-          docker compose config --services | grep -qx 'db'
+          sudo find "$MODULE" \
+            -type d -name '__pycache__' -prune -exec rm -rf {} +
 
-          # Verificar que PostgreSQL está disponible.
-          docker compose exec -T db \
+          sudo find "$MODULE" \
+            -type f -name '*.pyc' -delete
+
+          echo "Comprobando servicios de Docker Compose..."
+
+          sudo docker compose config --services | grep -qx 'odoo'
+          sudo docker compose config --services | grep -qx 'db'
+
+          echo "Comprobando disponibilidad de PostgreSQL..."
+
+          sudo docker compose exec -T db \
             pg_isready -U odoo -d "$ODOO_DB"
 
-          # Verificar que Odoo puede reconocer el módulo y actualizarlo.
-          # -u instala el módulo si aún no está instalado y actualiza
-          # sus vistas/datos si ya lo está.
-          docker compose run --rm --no-deps odoo \
-            odoo -d "$ODOO_DB" \
+          echo "Instalando o actualizando gestion_tareas..."
+
+          # -u actualiza el módulo si ya está instalado.
+          # Si todavía no está instalado, Odoo puede instalarlo
+          # si lo reconoce y está disponible en la base de datos.
+          sudo docker compose run --rm --no-deps odoo \
+            odoo \
+            -d "$ODOO_DB" \
             --db_host=db \
             --db_user=odoo \
             -u gestion_tareas \
             --stop-after-init
 
-          # Si hubo cambios XML, reiniciar el servicio Odoo para
-          # que el proceso normal vuelva a cargar el código actualizado.
+          echo "Actualización del módulo completada."
+
           if [ "$XML_CHANGED" = "true" ]; then
-            docker compose restart odoo
+            echo "Cambios XML detectados. Reiniciando Odoo..."
+            sudo docker compose restart odoo
+          else
+            echo "Sin cambios XML. No se requiere reinicio adicional."
           fi
 
-          # Confirmar estado del contenedor.
-          docker compose ps
+          echo "Estado final de los contenedores:"
+          sudo docker compose ps
+
           REMOTE
 
+      # 5. Confirmar que los pasos terminaron correctamente
       - name: Resultado del despliegue
-        run: echo "Despliegue y actualización de gestion_tareas finalizados."
+        run: |
+          echo "Despliegue de gestion_tareas completado correctamente."
