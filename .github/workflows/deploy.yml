@@ -1,5 +1,5 @@
-
-name: Deploy Odoo 17 module
+```yaml
+name: Deploy Odoo 17 - gestion_tareas
 
 on:
   push:
@@ -7,11 +7,8 @@ on:
       - main
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 concurrency:
-  group: deploy-odoo-production
+  group: deploy-odoo-produccion
   cancel-in-progress: false
 
 jobs:
@@ -19,81 +16,99 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Descargar código
         uses: actions/checkout@v4
 
-        
-      - name: Configure SSH and validate key
+      - name: Configurar SSH
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
-          set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-
-          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-
-          if ! ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/deploy_key.pub; then
-            echo "::error::EC2_SSH_KEY no es una clave privada válida o está incompleta."
-            exit 1
-          fi
-
-          echo "La clave privada es válida."
-          ssh-keygen -lf ~/.ssh/deploy_key.pub
-
           printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-
-      - name: Validate configuration
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-          ODOO_DB: ${{ secrets.ODOO_DB }}
-        run: |
-          test -n "$EC2_HOST"
-          test -n "$EC2_USER"
-          test -n "$ODOO_DB"
-          [[ "$ODOO_DB" =~ ^[A-Za-z0-9_]+$ ]]
-
-      - name: Copy module to EC2
+      - name: Sincronizar módulo con EC2
+        id: sync
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
+          set -euo pipefail
+
+          # Detectar cambios XML respecto al commit anterior.
+          if git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" \
+            | grep -E '^(.*/)?views/.*\.xml$'; then
+            echo "xml_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "xml_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # En la primera ejecución, forzar actualización.
+          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "xml_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          ssh "$EC2_USER@$EC2_HOST" \
+            'mkdir -p /home/ubuntu/odoo17/addons/gestion_tareas'
+
           rsync -az --delete \
             --exclude='.git/' \
             --exclude='.github/' \
-            -e "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes" \
+            -e "ssh -i ~/.ssh/id_ed25519" \
             ./ "$EC2_USER@$EC2_HOST:/home/ubuntu/odoo17/addons/gestion_tareas/"
 
-      - name: Upgrade Odoo module
+      - name: Limpiar caché y actualizar módulo
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           ODOO_DB: ${{ secrets.ODOO_DB }}
+          XML_CHANGED: ${{ steps.sync.outputs.xml_changed }}
         run: |
-          ssh -i ~/.ssh/id_ed25519 \
-            -o StrictHostKeyChecking=yes \
-            "$EC2_USER@$EC2_HOST" \
-            "bash -s -- '$ODOO_DB'" <<'REMOTE'
-          set -Eeuo pipefail
+          set -euo pipefail
 
-          DB="$1"
+          ssh "$EC2_USER@$EC2_HOST" \
+            "ODOO_DB='$ODOO_DB' XML_CHANGED='$XML_CHANGED' bash -s" <<'REMOTE'
+          set -euo pipefail
           cd /home/ubuntu/odoo17
 
-          # Stop the web service before modifying the database.
-          sudo docker compose stop odoo
+          MODULE=/home/ubuntu/odoo17/addons/gestion_tareas
 
-          # Always attempt to bring the web service back up.
-          if sudo docker compose run --rm --no-deps odoo \
-              odoo -d "$DB" -u gestion_tareas --stop-after-init; then
-            sudo docker compose up -d odoo
-          else
-            echo "Module upgrade failed"
-            sudo docker compose up -d odoo
-            exit 1
+          # Eliminar únicamente caché Python del módulo.
+          find "$MODULE" -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find "$MODULE" -type f -name '*.pyc' -delete
+
+          # Confirmar que Docker Compose contiene los servicios esperados.
+          docker compose config --services | grep -qx 'odoo'
+          docker compose config --services | grep -qx 'db'
+
+          # Verificar que PostgreSQL está disponible.
+          docker compose exec -T db \
+            pg_isready -U odoo -d "$ODOO_DB"
+
+          # Verificar que Odoo puede reconocer el módulo y actualizarlo.
+          # -u instala el módulo si aún no está instalado y actualiza
+          # sus vistas/datos si ya lo está.
+          docker compose run --rm --no-deps odoo \
+            odoo -d "$ODOO_DB" \
+            --db_host=db \
+            --db_user=odoo \
+            -u gestion_tareas \
+            --stop-after-init
+
+          # Si hubo cambios XML, reiniciar el servicio Odoo para
+          # que el proceso normal vuelva a cargar el código actualizado.
+          if [ "$XML_CHANGED" = "true" ]; then
+            docker compose restart odoo
           fi
+
+          # Confirmar estado del contenedor.
+          docker compose ps
           REMOTE
+
+      - name: Resultado del despliegue
+        run: echo "Despliegue y actualización de gestion_tareas finalizados."
+```
