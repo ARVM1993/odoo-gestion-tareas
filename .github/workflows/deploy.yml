@@ -1,0 +1,88 @@
+
+name: Deploy Odoo 17 module
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-odoo-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Validate configuration
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+        run: |
+          test -n "$EC2_HOST"
+          test -n "$EC2_USER"
+          test -n "$ODOO_DB"
+          [[ "$ODOO_DB" =~ ^[A-Za-z0-9_]+$ ]]
+
+      - name: Copy module to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          rsync -az --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            -e "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes" \
+            ./ "$EC2_USER@$EC2_HOST:/home/ubuntu/odoo17/addons/gestion_tareas/"
+
+      - name: Upgrade Odoo module
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "bash -s -- '$ODOO_DB'" <<'REMOTE'
+          set -Eeuo pipefail
+
+          DB="$1"
+          cd /home/ubuntu/odoo17
+
+          # Stop the web service before modifying the database.
+          sudo docker compose stop odoo
+
+          # Always attempt to bring the web service back up.
+          if sudo docker compose run --rm --no-deps odoo \
+              odoo -d "$DB" -u gestion_tareas --stop-after-init; then
+            sudo docker compose up -d odoo
+          else
+            echo "Module upgrade failed"
+            sudo docker compose up -d odoo
+            exit 1
+          fi
+          REMOTE
