@@ -1,7 +1,5 @@
-
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <!-- Vista de lista -->
     <record id="view_gestion_tarea_tree" model="ir.ui.view">
         <field name="name">gestion.tarea.tree</field>
         <field name="model">gestion.tarea</field>
