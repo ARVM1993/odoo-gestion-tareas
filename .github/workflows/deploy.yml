@@ -73,7 +73,7 @@ jobs:
             "$EC2_USER@$EC2_HOST:/home/ubuntu/odoo17/addons/gestion_tareas/"
 
       # 4. Limpiar caché, instalar/actualizar y reiniciar si procede
-      - name: Limpiar caché y actualizar módulo
+      - name: Limpiar caché, instalar o actualizar módulo
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
@@ -87,52 +87,68 @@ jobs:
           set -euo pipefail
 
           cd /home/ubuntu/odoo17
-
           MODULE=/home/ubuntu/odoo17/addons/gestion_tareas
 
-          echo "Limpiando caché Python del módulo..."
+          echo "Limpiando caché Python..."
+          sudo find "$MODULE" -type d -name '__pycache__' \
+            -prune -exec rm -rf {} +
+          sudo find "$MODULE" -type f -name '*.pyc' -delete
 
-          sudo find "$MODULE" \
-            -type d -name '__pycache__' -prune -exec rm -rf {} +
-
-          sudo find "$MODULE" \
-            -type f -name '*.pyc' -delete
-
-          echo "Comprobando servicios de Docker Compose..."
-
+          echo "Comprobando servicios..."
           sudo docker compose config --services | grep -qx 'odoo'
           sudo docker compose config --services | grep -qx 'db'
 
-          echo "Comprobando disponibilidad de PostgreSQL..."
-
+          echo "Comprobando PostgreSQL..."
           sudo docker compose exec -T db \
             pg_isready -U odoo -d "$ODOO_DB"
 
-          echo "Instalando o actualizando gestion_tareas..."
-
-          # -u actualiza el módulo si ya está instalado.
-          # Si todavía no está instalado, Odoo puede instalarlo
-          # si lo reconoce y está disponible en la base de datos.
+          echo "Actualizando lista de módulos..."
           sudo docker compose run --rm --no-deps odoo \
-            odoo \
-            -d "$ODOO_DB" \
+            odoo -d "$ODOO_DB" \
             --db_host=db \
             --db_user=odoo \
-            -u gestion_tareas \
+            --stop-after-init \
+            --update=base
+
+          echo "Consultando estado de gestion_tareas..."
+          STATE=$(sudo docker compose exec -T db \
+            psql -U odoo -d "$ODOO_DB" -tA \
+            -c "SELECT state FROM ir_module_module WHERE name = 'gestion_tareas' LIMIT 1;" \
+            | tr -d '[:space:]')
+
+          if [ "$STATE" = "installed" ]; then
+            echo "El módulo ya está instalado. Actualizando..."
+            ACTION="-u"
+          else
+            echo "El módulo no está instalado (estado: ${STATE:-no registrado}). Instalándolo..."
+            ACTION="-i"
+          fi
+
+          sudo docker compose run --rm --no-deps odoo \
+            odoo -d "$ODOO_DB" \
+            --db_host=db \
+            --db_user=odoo \
+            "$ACTION" gestion_tareas \
             --stop-after-init
 
-          echo "Actualización del módulo completada."
+          echo "Verificando resultado..."
+          STATE=$(sudo docker compose exec -T db \
+            psql -U odoo -d "$ODOO_DB" -tA \
+            -c "SELECT state FROM ir_module_module WHERE name = 'gestion_tareas' LIMIT 1;" \
+            | tr -d '[:space:]')
+
+          if [ "$STATE" != "installed" ]; then
+            echo "ERROR: gestion_tareas no quedó instalado. Estado: ${STATE:-no registrado}"
+            exit 1
+          fi
 
           if [ "$XML_CHANGED" = "true" ]; then
             echo "Cambios XML detectados. Reiniciando Odoo..."
             sudo docker compose restart odoo
-          else
-            echo "Sin cambios XML. No se requiere reinicio adicional."
           fi
 
-          echo "Estado final de los contenedores:"
           sudo docker compose ps
-
+          echo "gestion_tareas está instalado correctamente."
           REMOTE
 
       # 5. Confirmar que los pasos terminaron correctamente
