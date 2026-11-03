@@ -8,7 +8,6 @@ on:
 
 # Evita despliegues solapados en producción.
 # Si llegan varios pushes seguidos se encolan (no se cancelan).
-
 concurrency:
   group: deploy-odoo-produccion
   cancel-in-progress: false
@@ -24,15 +23,17 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # ------------------------------------------------------------------
       # 1. Descargar código del repositorio (con historial para git diff)
-    
+      # ------------------------------------------------------------------
       - name: Descargar código
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0   # necesario para comparar BEFORE..AFTER sin problemas
-    
+
+      # ------------------------------------------------------------------
       # 2. Asegurar rsync disponible en el runner
-    
+      # ------------------------------------------------------------------
       - name: Instalar rsync
         run: |
           set -euo pipefail
@@ -42,8 +43,9 @@ jobs:
           fi
           rsync --version | head -n1
 
+      # ------------------------------------------------------------------
       # 3. Configurar conexión SSH
-      
+      # ------------------------------------------------------------------
       - name: Configurar SSH
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
@@ -64,8 +66,9 @@ jobs:
           # Validación temprana de la clave
           ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null
 
+      # ------------------------------------------------------------------
       # 4. Detectar cambios y sincronizar addon con EC2
-      
+      # ------------------------------------------------------------------
       - name: Sincronizar módulo con EC2
         id: sync
         env:
@@ -128,25 +131,33 @@ jobs:
             ./ \
             "$EC2_USER@$EC2_HOST:/home/ubuntu/odoo17/addons/gestion_tareas/"
 
+      # ------------------------------------------------------------------
       # 5. Limpiar caché, instalar/actualizar módulo y reiniciar si procede
-      
+      # ------------------------------------------------------------------
       - name: Instalar o actualizar módulo en EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_DB_PASSWORD: ${{ secrets.ODOO_DB_PASSWORD }}
           CODE_CHANGED: ${{ steps.sync.outputs.code_changed }}
           MANIFEST_CHANGED: ${{ steps.sync.outputs.manifest_changed }}
         run: |
           set -euo pipefail
 
-          ssh -o BatchMode=yes -i ~/.ssh/id_ed25519 \
-            "$EC2_USER@$EC2_HOST" \
-            "ODOO_DB='$ODOO_DB' CODE_CHANGED='$CODE_CHANGED' MANIFEST_CHANGED='$MANIFEST_CHANGED' bash -s" <<'REMOTE'
+          # 1. Escribir el script remoto en un fichero local
+          cat > /tmp/remote_deploy.sh <<'REMOTE_SCRIPT'
+          #!/usr/bin/env bash
           set -euo pipefail
 
           cd /home/ubuntu/odoo17
           MODULE=/home/ubuntu/odoo17/addons/gestion_tareas
+
+          # Password opcional: si está vacío, se omite
+          DB_PASS_OPT=""
+          if [ -n "${ODOO_DB_PASSWORD:-}" ]; then
+            DB_PASS_OPT="--db_password=${ODOO_DB_PASSWORD}"
+          fi
 
           echo "==> Limpiando caché Python del módulo..."
           sudo find "$MODULE" -type d -name '__pycache__' -prune -print -exec rm -rf {} +
@@ -175,14 +186,13 @@ jobs:
             fi
           done
 
-          # Actualizar base solo si cambió el manifest (dependencias)
-          
           if [ "$MANIFEST_CHANGED" = "true" ]; then
             echo "==> __manifest__.py cambió: actualizando base..."
-            sudo docker compose run --rm --no-deps odoo \
+            timeout 600 sudo docker compose run --rm --no-deps odoo \
               odoo -d "$ODOO_DB" \
               --db_host=db \
               --db_user=odoo \
+              $DB_PASS_OPT \
               --no-http \
               --stop-after-init \
               --update=base
@@ -190,8 +200,6 @@ jobs:
             echo "==> Manifest sin cambios: se omite --update=base."
           fi
 
-          # Detectar estado actual del módulo: instalar o actualizar
-          
           echo "==> Consultando estado de gestion_tareas..."
           STATE=$(sudo docker compose exec -T db \
             psql -U odoo -d "$ODOO_DB" -tA \
@@ -207,15 +215,14 @@ jobs:
           fi
 
           echo "==> Ejecutando odoo $ACTION gestion_tareas..."
-          sudo docker compose run --rm --no-deps odoo \
+          timeout 900 sudo docker compose run --rm --no-deps odoo \
             odoo -d "$ODOO_DB" \
             --db_host=db \
             --db_user=odoo \
+            $DB_PASS_OPT \
             --no-http \
             "$ACTION" gestion_tareas \
             --stop-after-init
-
-          # Verificar resultado final
 
           echo "==> Verificando estado final del módulo..."
           STATE=$(sudo docker compose exec -T db \
@@ -229,12 +236,9 @@ jobs:
           fi
           echo "    Estado final: $STATE"
 
-          # Reiniciar Odoo si hubo cambios de código (py/xml/js/css/...)
-          
           if [ "$CODE_CHANGED" = "true" ]; then
             echo "==> Cambios de código detectados: reiniciando Odoo..."
             sudo docker compose restart odoo
-
             echo "==> Esperando a que Odoo arranque..."
             sleep 10
             if ! sudo docker compose ps odoo | grep -qE 'Up|running'; then
@@ -254,10 +258,30 @@ jobs:
           sudo docker compose logs --tail=20 odoo || true
 
           echo "✅ Despliegue de gestion_tareas completado correctamente."
-          REMOTE
+          REMOTE_SCRIPT
 
+          # CRÍTICO: eliminar la indentación de 10 espacios que YAML mete en el heredoc
+          sed -i 's/^          //' /tmp/remote_deploy.sh
+
+          # Sanity check: el script debe empezar por #!/usr/bin/env bash
+          head -n1 /tmp/remote_deploy.sh | grep -q '^#!/usr/bin/env bash' \
+            || { echo "ERROR: el script remoto no empieza con shebang"; head -n3 /tmp/remote_deploy.sh; exit 1; }
+
+          chmod +x /tmp/remote_deploy.sh
+
+          # 2. Copiarlo a la EC2
+          scp -o BatchMode=yes -i ~/.ssh/id_ed25519 \
+            /tmp/remote_deploy.sh \
+            "$EC2_USER@$EC2_HOST:/tmp/remote_deploy.sh"
+
+          # 3. Ejecutarlo pasando las variables como entorno
+          ssh -o BatchMode=yes -i ~/.ssh/id_ed25519 \
+            "$EC2_USER@$EC2_HOST" \
+            "ODOO_DB='$ODOO_DB' ODOO_DB_PASSWORD='$ODOO_DB_PASSWORD' CODE_CHANGED='$CODE_CHANGED' MANIFEST_CHANGED='$MANIFEST_CHANGED' bash /tmp/remote_deploy.sh"
+
+      # ------------------------------------------------------------------
       # 6. Confirmación final del step
-      
+      # ------------------------------------------------------------------
       - name: Resultado del despliegue
         run: |
           echo "✅ Despliegue de gestion_tareas completado correctamente."
