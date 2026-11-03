@@ -1,4 +1,4 @@
-name: Deploy Odoo 17 - gestion_tareas
+name: Desplegar - gestion_tareas
 
 on:
   push:
@@ -6,20 +6,44 @@ on:
       - main
   workflow_dispatch:
 
+# Evita despliegues solapados en producción.
+# Si llegan varios pushes seguidos se encolan (no se cancelan).
+
 concurrency:
   group: deploy-odoo-produccion
   cancel-in-progress: false
 
+# Permisos mínimos necesarios
+permissions:
+  contents: read
+
 jobs:
   deploy:
+    name: Desplegar gestion_tareas en EC2
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      # 1. Descargar código del repositorio
+      # 1. Descargar código del repositorio (con historial para git diff)
+    
       - name: Descargar código
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # necesario para comparar BEFORE..AFTER sin problemas
+    
+      # 2. Asegurar rsync disponible en el runner
+    
+      - name: Instalar rsync
+        run: |
+          set -euo pipefail
+          if ! command -v rsync >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq rsync
+          fi
+          rsync --version | head -n1
 
-      # 2. Configurar conexión SSH
+      # 3. Configurar conexión SSH
+      
       - name: Configurar SSH
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
@@ -30,13 +54,18 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          # Saneamos CRLF por si el secret viene de Windows
+          printf '%s\n' "$EC2_SSH_KEY"     | tr -d '\r' > ~/.ssh/id_ed25519
+          printf '%s\n' "$EC2_KNOWN_HOSTS" | tr -d '\r' > ~/.ssh/known_hosts
 
-          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/known_hosts
 
-      # 3. Detectar cambios XML y sincronizar addon
+          # Validación temprana de la clave
+          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null
+
+      # 4. Detectar cambios y sincronizar addon con EC2
+      
       - name: Sincronizar módulo con EC2
         id: sync
         env:
@@ -48,110 +77,190 @@ jobs:
           BEFORE="${{ github.event.before }}"
           AFTER="${{ github.sha }}"
 
-          # En ejecuciones manuales o primeros commits,
-          # forzar la comprobación de cambios XML.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] ||
-             [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            echo "xml_changed=true" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only "$BEFORE" "$AFTER" \
-               | grep -E '(^|/)views/.*\.xml$'; then
-            echo "xml_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "xml_changed=false" >> "$GITHUB_OUTPUT"
+          # Por defecto asumimos que hay cambios (caso seguro).
+          CODE_CHANGED=true
+          MANIFEST_CHANGED=true
+
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && \
+             [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && \
+             git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+
+            CHANGED_FILES=$(git diff --name-only "$BEFORE" "$AFTER")
+
+            if echo "$CHANGED_FILES" | grep -qE '\.(py|xml|js|css|scss|sass|csv|po|pot|png|jpg|jpeg|svg|gif)$'; then
+              CODE_CHANGED=true
+            else
+              CODE_CHANGED=false
+            fi
+
+            if echo "$CHANGED_FILES" | grep -qE '(^|/)__manifest__\.py$'; then
+              MANIFEST_CHANGED=true
+            else
+              MANIFEST_CHANGED=false
+            fi
           fi
 
-          # Crear directorio remoto
-          ssh "$EC2_USER@$EC2_HOST" \
+          echo "code_changed=$CODE_CHANGED"         >> "$GITHUB_OUTPUT"
+          echo "manifest_changed=$MANIFEST_CHANGED" >> "$GITHUB_OUTPUT"
+          echo "Cambios de código: $CODE_CHANGED | manifest: $MANIFEST_CHANGED"
+
+          # Crear directorio remoto del addon
+          ssh -o BatchMode=yes -i ~/.ssh/id_ed25519 \
+            "$EC2_USER@$EC2_HOST" \
             'mkdir -p /home/ubuntu/odoo17/addons/gestion_tareas'
 
-          # Copiar el módulo a EC2
+          # Sincronizar addon (la raíz del repo ES el módulo)
           rsync -az --delete \
             --exclude='.git/' \
             --exclude='.github/' \
-            -e "ssh -i ~/.ssh/id_ed25519" \
+            --exclude='.venv/' \
+            --exclude='venv/' \
+            --exclude='env/' \
+            --exclude='node_modules/' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='*.pyo' \
+            --exclude='*.log' \
+            --exclude='.DS_Store' \
+            --exclude='.idea/' \
+            --exclude='.vscode/' \
+            -e "ssh -o BatchMode=yes -i ~/.ssh/id_ed25519" \
             ./ \
             "$EC2_USER@$EC2_HOST:/home/ubuntu/odoo17/addons/gestion_tareas/"
 
-      # 4. Limpiar caché, instalar/actualizar y reiniciar si procede
-      - name: Limpiar caché, instalar o actualizar módulo
+      # 5. Limpiar caché, instalar/actualizar módulo y reiniciar si procede
+      
+      - name: Instalar o actualizar módulo en EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           ODOO_DB: ${{ secrets.ODOO_DB }}
-          XML_CHANGED: ${{ steps.sync.outputs.xml_changed }}
+          CODE_CHANGED: ${{ steps.sync.outputs.code_changed }}
+          MANIFEST_CHANGED: ${{ steps.sync.outputs.manifest_changed }}
         run: |
           set -euo pipefail
 
-          ssh "$EC2_USER@$EC2_HOST" \
-            "ODOO_DB='$ODOO_DB' XML_CHANGED='$XML_CHANGED' bash -s" <<'REMOTE'
+          ssh -o BatchMode=yes -i ~/.ssh/id_ed25519 \
+            "$EC2_USER@$EC2_HOST" \
+            "ODOO_DB='$ODOO_DB' CODE_CHANGED='$CODE_CHANGED' MANIFEST_CHANGED='$MANIFEST_CHANGED' bash -s" <<'REMOTE'
           set -euo pipefail
 
           cd /home/ubuntu/odoo17
           MODULE=/home/ubuntu/odoo17/addons/gestion_tareas
 
-          echo "Limpiando caché Python..."
-          sudo find "$MODULE" -type d -name '__pycache__' \
-            -prune -exec rm -rf {} +
-          sudo find "$MODULE" -type f -name '*.pyc' -delete
+          echo "==> Limpiando caché Python del módulo..."
+          sudo find "$MODULE" -type d -name '__pycache__' -prune -print -exec rm -rf {} +
+          sudo find "$MODULE" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
-          echo "Comprobando servicios..."
-          sudo docker compose config --services | grep -qx 'odoo'
-          sudo docker compose config --services | grep -qx 'db'
+          echo "==> Comprobando servicios definidos en docker compose..."
+          sudo docker compose config --services | grep -qx 'odoo' \
+            || { echo "ERROR: servicio 'odoo' no definido"; exit 1; }
+          sudo docker compose config --services | grep -qx 'db' \
+            || { echo "ERROR: servicio 'db' no definido"; exit 1; }
 
-          echo "Comprobando PostgreSQL..."
-          sudo docker compose exec -T db \
-            pg_isready -U odoo -d "$ODOO_DB"
+          echo "==> Levantando DB si no está corriendo..."
+          sudo docker compose up -d db
 
-          echo "Actualizando lista de módulos..."
-          sudo docker compose run --rm --no-deps odoo \
-            odoo -d "$ODOO_DB" \
-            --db_host=db \
-            --db_user=odoo \
-            --stop-after-init \
-            --update=base
+          echo "==> Esperando a PostgreSQL..."
+          for i in $(seq 1 30); do
+            if sudo docker compose exec -T db pg_isready -U odoo -d "$ODOO_DB" >/dev/null 2>&1; then
+              echo "PostgreSQL listo."
+              break
+            fi
+            echo "  intento $i/30..."
+            sleep 2
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: PostgreSQL no responde"
+              exit 1
+            fi
+          done
 
-          echo "Consultando estado de gestion_tareas..."
+          # Actualizar base solo si cambió el manifest (dependencias)
+          
+          if [ "$MANIFEST_CHANGED" = "true" ]; then
+            echo "==> __manifest__.py cambió: actualizando base..."
+            sudo docker compose run --rm --no-deps odoo \
+              odoo -d "$ODOO_DB" \
+              --db_host=db \
+              --db_user=odoo \
+              --no-http \
+              --stop-after-init \
+              --update=base
+          else
+            echo "==> Manifest sin cambios: se omite --update=base."
+          fi
+
+          # Detectar estado actual del módulo: instalar o actualizar
+          
+          echo "==> Consultando estado de gestion_tareas..."
           STATE=$(sudo docker compose exec -T db \
             psql -U odoo -d "$ODOO_DB" -tA \
-            -c "SELECT state FROM ir_module_module WHERE name = 'gestion_tareas' LIMIT 1;" \
+            -c "SELECT state FROM ir_module_module WHERE name='gestion_tareas' LIMIT 1;" \
             | tr -d '[:space:]')
 
           if [ "$STATE" = "installed" ]; then
-            echo "El módulo ya está instalado. Actualizando..."
+            echo "    Módulo instalado. Se actualizará (-u)."
             ACTION="-u"
           else
-            echo "El módulo no está instalado (estado: ${STATE:-no registrado}). Instalándolo..."
+            echo "    Módulo no instalado (estado: '${STATE:-no registrado}'). Se instalará (-i)."
             ACTION="-i"
           fi
 
+          echo "==> Ejecutando odoo $ACTION gestion_tareas..."
           sudo docker compose run --rm --no-deps odoo \
             odoo -d "$ODOO_DB" \
             --db_host=db \
             --db_user=odoo \
+            --no-http \
             "$ACTION" gestion_tareas \
             --stop-after-init
 
-          echo "Verificando resultado..."
+          # Verificar resultado final
+
+          echo "==> Verificando estado final del módulo..."
           STATE=$(sudo docker compose exec -T db \
             psql -U odoo -d "$ODOO_DB" -tA \
-            -c "SELECT state FROM ir_module_module WHERE name = 'gestion_tareas' LIMIT 1;" \
+            -c "SELECT state FROM ir_module_module WHERE name='gestion_tareas' LIMIT 1;" \
             | tr -d '[:space:]')
 
           if [ "$STATE" != "installed" ]; then
-            echo "ERROR: gestion_tareas no quedó instalado. Estado: ${STATE:-no registrado}"
+            echo "ERROR: gestion_tareas no quedó instalado. Estado: '${STATE:-no registrado}'"
             exit 1
           fi
+          echo "    Estado final: $STATE"
 
-          if [ "$XML_CHANGED" = "true" ]; then
-            echo "Cambios XML detectados. Reiniciando Odoo..."
+          # Reiniciar Odoo si hubo cambios de código (py/xml/js/css/...)
+          
+          if [ "$CODE_CHANGED" = "true" ]; then
+            echo "==> Cambios de código detectados: reiniciando Odoo..."
             sudo docker compose restart odoo
+
+            echo "==> Esperando a que Odoo arranque..."
+            sleep 10
+            if ! sudo docker compose ps odoo | grep -qE 'Up|running'; then
+              echo "ERROR: Odoo no está corriendo tras el reinicio."
+              sudo docker compose logs --tail=100 odoo
+              exit 1
+            fi
+            echo "    Odoo está Up."
+          else
+            echo "==> Sin cambios de código: no se reinicia Odoo."
           fi
 
+          echo "==> Estado final de contenedores:"
           sudo docker compose ps
-          echo "gestion_tareas está instalado correctamente."
+
+          echo "==> Últimas líneas de log de Odoo:"
+          sudo docker compose logs --tail=20 odoo || true
+
+          echo "✅ Despliegue de gestion_tareas completado correctamente."
           REMOTE
 
-      # 5. Confirmar que los pasos terminaron correctamente
+      # 6. Confirmación final del step
+      
       - name: Resultado del despliegue
         run: |
-          echo "Despliegue de gestion_tareas completado correctamente."
+          echo "✅ Despliegue de gestion_tareas completado correctamente."
+          echo "   Commit: ${{ github.sha }}"
+          echo "   Ref:    ${{ github.ref_name }}"
+          echo "   Trigger:${{ github.event_name }}"
